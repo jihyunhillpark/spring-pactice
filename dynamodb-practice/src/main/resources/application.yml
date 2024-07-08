@@ -1,0 +1,9 @@
+spring:
+  application:
+    name: dynamodb-practice
+amazon:
+  dynamodb:
+    endpoint: http://localhost:8000/
+  aws:
+    accesskey: key
+    secretkey: key2
