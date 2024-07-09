@@ -1,160 +1,159 @@
 package me.study.practice.service;
 
 import lombok.RequiredArgsConstructor;
-import me.study.practice.domain.AttributesDataType;
-import me.study.practice.domain.EventApply;
-import me.study.practice.domain.Prize;
+import lombok.extern.slf4j.Slf4j;
+import me.study.practice.domain.EventCustomData;
 import me.study.practice.domain.PrizeType;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient;
 import software.amazon.awssdk.enhanced.dynamodb.DynamoDbTable;
 import software.amazon.awssdk.enhanced.dynamodb.Expression;
-import software.amazon.awssdk.enhanced.dynamodb.Key;
 import software.amazon.awssdk.enhanced.dynamodb.TableSchema;
-import software.amazon.awssdk.enhanced.dynamodb.model.CreateTableEnhancedRequest;
+import software.amazon.awssdk.enhanced.dynamodb.model.PutItemEnhancedRequest;
 import software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional;
 import software.amazon.awssdk.enhanced.dynamodb.model.QueryEnhancedRequest;
 import software.amazon.awssdk.enhanced.dynamodb.model.ScanEnhancedRequest;
 import software.amazon.awssdk.enhanced.dynamodb.model.UpdateItemEnhancedRequest;
-import software.amazon.awssdk.enhanced.dynamodb.model.UpdateItemEnhancedResponse;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
 
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class EventApplyService {
-    private static final String DATA_TYPE_APPLY = AttributesDataType.EVENT_APPLY.name();
-    private static final int MAX_APPLICANTS = 1000;
     private static final String TABLE_NAME = "other-data";
     private final DynamoDbEnhancedClient dynamoDbClient;
-    private final DynamoDbTable<EventApply> eventApply;
-    private final DynamoDbTable<Prize> prize;
+    private final DynamoDbTable<EventCustomData> eventCustomDataTable;
 
     @Autowired
-    EventApplyService(DynamoDbEnhancedClient dynamoDbClient) {
+    EventApplyService(final DynamoDbEnhancedClient dynamoDbClient) {
         this.dynamoDbClient = dynamoDbClient;
-        this.eventApply = dynamoDbClient.table(TABLE_NAME, TableSchema.fromBean(EventApply.class));
-        this.prize = dynamoDbClient.table(TABLE_NAME, TableSchema.fromBean(Prize.class));
+        this.eventCustomDataTable = dynamoDbClient.table(TABLE_NAME, TableSchema.fromBean(EventCustomData.class));
     }
 
-    private void createTable() {
-        CreateTableEnhancedRequest request = CreateTableEnhancedRequest.builder()
-                                                                       .provisionedThroughput(software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput
-                                                                                                  .builder()
-                                                                                                  .readCapacityUnits(10L)
-                                                                                                  .writeCapacityUnits(10L)
-                                                                                                  .build())
-                                                                       .build();
-
-        eventApply.createTable(request);
-        prize.createTable(request);
-        System.out.println("Tables created: " + TABLE_NAME);
+    DynamoDbTable<EventCustomData> getEventCustomDataTable() {
+        return eventCustomDataTable;
     }
 
-    public void apply(String eventId, String userId, PrizeType prizeType) {
-        if (getEventApplyCount() >= MAX_APPLICANTS) {
-            System.out.println("EventApply limit reached");
+    public void apply(final String eventId, final String memberNumber, final PrizeType prizeType) {
+        validateApply(memberNumber, eventId);
+        final EventCustomData keyItem = EventCustomData.builder()
+                                                       .primaryKey(eventId)
+                                                       .build();
+        // 업데이트를 위한 항목을 로드
+        final EventCustomData existingItem = eventCustomDataTable.getItem(keyItem);
+        final Map<String, String> contents = existingItem.getContents();
+
+        // stock 값을 가져와 0 이상인지 확인하고 1 감소
+        int stock = Integer.parseInt(contents.get("stock"));
+        if (0 < stock) {
+            stock--;
+            contents.put("stock", String.valueOf(stock));
+        } else {
+            // 조건에 맞지 않으면 반환
             return;
         }
+        existingItem.setContents(contents);
 
-        if (isApplied(userId)) {
-            System.out.println("User has already applied");
-            return;
+        // 업데이트 요청
+        final UpdateItemEnhancedRequest<EventCustomData> request = UpdateItemEnhancedRequest.builder(EventCustomData.class)
+                                                                                            .item(existingItem)
+                                                                                            .build();
+        // user 파티션키 생성
+        final PutItemEnhancedRequest<EventCustomData> request2 = PutItemEnhancedRequest.builder(EventCustomData.class)
+                                                                                       .item(EventCustomData.builder()
+                                                                                                            .primaryKey(memberNumber)
+                                                                                                            .contents(Map.of("eventId",
+                                                                                                                             eventId,
+                                                                                                                             "prizeType",
+                                                                                                                             prizeType.name()))
+                                                                                                            .build())
+                                                                                       .build();
+
+        // 업데이트 수행
+        try {
+            dynamoDbClient.transactWriteItems(r -> r.addUpdateItem(eventCustomDataTable, request)
+                                                    .addPutItem(eventCustomDataTable, request2));
+        } catch (final DynamoDbException e) {
+            log.error(e.getMessage());
         }
-
-        EventApply eventApply = EventApply.builder()
-                                          .eventId(eventId)
-                                          .userId(userId)
-                                          .prizeType(prizeType.name())
-                                          .build();
-
-        final UpdateItemEnhancedResponse response = decreaseStock(eventId, prizeType);
-        if (response != null) {
-            System.out.println("Decreased stock for " + eventId);
-            this.eventApply.putItem(eventApply);
-        }
-        System.out.println("User " + userId + " applied and received " + prizeType);
+        log.info("apply success : eventId [ %s ] contents was updated!", eventId);
     }
 
-    public List<EventApply> getUserApplyHistory(String eventId, String userId) {
-        QueryConditional keyConditional = QueryConditional
-            .keyEqualTo(k -> k.partitionValue(DATA_TYPE_APPLY).sortValue(eventId));
-        final Expression filterUserConditional = Expression.builder()
-                                                           .expression("userId = :userId")
-                                                           .expressionValues(Map.of(":userId", AttributeValue.builder().s(userId).build()))
-                                                           .build();
+    public List<EventCustomData> getUserApplyHistory(final String eventId, final String memberNumber) {
+        final QueryEnhancedRequest queryConditionals = getUserApplyHistoryQuery(eventId,
+                                                                                memberNumber);
 
-        QueryEnhancedRequest queryConditionals = QueryEnhancedRequest.builder()
-                                                                     .consistentRead(true) // 이걸로 동시성이 해결되려나?
-                                                                     .queryConditional(keyConditional)
-                                                                     .filterExpression(filterUserConditional)
-                                                                     .build();
-
-        return this.eventApply.query(queryConditionals)
-                              .items()
-                              .stream()
-                              .collect(Collectors.toUnmodifiableList());
+        return eventCustomDataTable.query(queryConditionals)
+                                   .items()
+                                   .stream()
+                                   .toList();
     }
 
-    public List<String> getPrizeSuppliedUsers(String eventId, String userId, String prizeType) {
-        Map<String, AttributeValue> exclusiveStartKeys = Map.of(
-            ":dataType", AttributeValue.builder().s(AttributesDataType.PRIZE.name()).build(),
-            ":eventId", AttributeValue.builder().s(userId).build());
-        Map<String, AttributeValue> expressionValues = Map.of(
-            ":userId", AttributeValue.builder().s(eventId).build(),
-            ":prizeType", AttributeValue.builder().s(prizeType).build());
-        ScanEnhancedRequest scanRequest = ScanEnhancedRequest.builder()
-                                                             .consistentRead(true)
-                                                             .attributesToProject("dataType", "eventId", "userId", "prizeType")
-                                                             .exclusiveStartKey(exclusiveStartKeys)
-                                                             .filterExpression(Expression.builder()
-                                                                                         .expression(
-                                                                                             "userId = :userId and prizeType = :prizeType")
-                                                                                         .expressionValues(expressionValues)
-                                                                                         .build())
-                                                             .build();
+    public List<String> getPrizeSuppliedUsers(final String eventId, final String prizeType) {
+        final Expression filterConditional = Expression.builder()
+                                                       .expression("contents.eventId = :eventId and contents.prizeType = :prizeType")
+                                                       .expressionValues(Map.of(":eventId",
+                                                                                AttributeValue.builder().s(eventId).build(),
+                                                                                ":prizeType",
+                                                                                AttributeValue.builder().s(prizeType).build()))
+                                                       .build();
+        final ScanEnhancedRequest scanRequest = ScanEnhancedRequest.builder()
+                                                                   .consistentRead(true)
+                                                                   .attributesToProject("primaryKey", "contents")
+                                                                   .filterExpression(filterConditional)
+                                                                   .build();
 
-        return eventApply.scan(scanRequest)
-                         .items()
-                         .stream()
-                         .map(EventApply::getUserId)
-                         .collect(Collectors.toUnmodifiableList());
+        return eventCustomDataTable.scan(scanRequest)
+                                   .items()
+                                   .stream()
+                                   .map(EventCustomData::getPrimaryKey)
+                                   .toList();
     }
 
-    private boolean isApplied(String userId) {
-        QueryConditional queryConditional = QueryConditional
-            .keyEqualTo(k -> k.partitionValue(DATA_TYPE_APPLY).sortValue(userId));
+    private QueryEnhancedRequest getUserApplyHistoryQuery(final String eventId, final String memberNumber) {
+        final QueryConditional keyConditional = QueryConditional
+            .keyEqualTo(k -> k.partitionValue(memberNumber));
+        final Expression userConditional = Expression.builder()
+                                                     .expression("contents.eventId = :eventId")
+                                                     .expressionValues(Map.of(":eventId",
+                                                                              AttributeValue.builder().s(eventId).build()))
+                                                     .build();
 
-        return eventApply.query(r -> r.queryConditional(queryConditional))
-                         .items()
-                         .stream()
-                         .findFirst()
-                         .isPresent();
+        return QueryEnhancedRequest.builder()
+                                   .consistentRead(true) // 이걸로 동시성이 해결되려나?
+                                   .queryConditional(keyConditional)
+                                   .filterExpression(userConditional)
+                                   .build();
     }
 
-    private int getEventApplyCount() {
-        return (int) eventApply.scan().items().stream().count();
-    }
+    private void validateApply(final String memberNumber, final String eventId) {
+        final QueryConditional eventKeyConditional = QueryConditional
+            .keyEqualTo(key -> key.partitionValue(eventId));
+        final QueryEnhancedRequest queryConditionals = getUserApplyHistoryQuery(eventId, memberNumber);
 
-    public UpdateItemEnhancedResponse decreaseStock(final String eventId, final PrizeType prizeType) {
-        final UpdateItemEnhancedRequest<Prize> decreaseStockRequest = UpdateItemEnhancedRequest.builder(Prize.class)
-                                                                                               .item(this.prize
-                                                                                                         .getItem(Key.builder()
-                                                                                                                     .partitionValue(
-                                                                                                                         AttributesDataType.PRIZE.name())
-                                                                                                                     .sortValue(eventId)
-                                                                                                                     .build())
-                                                                                                         .decreaseStock())
-                                                                                               .conditionExpression(Expression.builder()
-                                                                                                                              .expression(
-                                                                                                                                  "#stock > :zero")
-                                                                                                                              .build())
-                                                                                               .ignoreNulls(true)
-                                                                                               .build();
-        return this.prize.updateItemWithResponse(decreaseStockRequest); // 상품 재고 감소
+        final long applyCount = eventCustomDataTable.query(queryConditionals)
+                                                    .items()
+                                                    .stream()
+                                                    .count();
+
+        eventCustomDataTable.query(r -> r.queryConditional(eventKeyConditional))
+                            .items()
+                            .stream()
+                            .findAny()
+                            .ifPresent(eventCustomData -> {
+                                final Map<String, String> contents = eventCustomData.getContents();
+                                final long applyLimit = Long.parseLong(contents.get("limit"));
+                                if (applyLimit <= applyCount) {
+                                    throw new IllegalArgumentException("이벤트 신청자 횟수를 초과했습니다.");
+                                }
+                                if (0 >= Integer.parseInt(contents.get("stock"))) {
+                                    throw new IllegalArgumentException("경품 재고가 부족합니다.");
+                                }
+                            });
     }
 }
