@@ -1,5 +1,7 @@
 package me.study.practice.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import me.study.practice.config.DynamoDBConfig;
 import me.study.practice.domain.EventCustomData;
 import me.study.practice.domain.PrizeType;
@@ -15,6 +17,7 @@ import software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional;
 import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput;
 
 import java.util.Map;
+import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatList;
@@ -33,19 +36,27 @@ class EventApplyServiceTest {
     private DynamoDbTable<EventCustomData> eventDataTable;
     @Autowired
     private EventApplyService eventApplyService;
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws JsonProcessingException {
         eventDataTable = initiateTable();
         eventDataTable.putItem(EventCustomData.builder()
                                               .primaryKey(TEST_EVENT_PK)
                                               .contents(Map.of("limit", "1",
-                                                               "stock", String.valueOf(MAX_APPLICANTS)))
+                                                               "dailyLimit", "1",
+                                                               "stock", String.valueOf(MAX_APPLICANTS),
+                                                               "prizeStock", objectMapper.writeValueAsString(Map.of("coupon", "100",
+                                                                                                                    "point", "1000"))))
                                               .build());
         eventDataTable.putItem(EventCustomData.builder()
                                               .primaryKey(TEST_EVENT_PK2)
                                               .contents(Map.of("limit", "1",
-                                                               "stock", String.valueOf(MAX_APPLICANTS)))
+                                                               "dailyLimit", "1",
+                                                               "stock", String.valueOf(MAX_APPLICANTS),
+                                                               "prizeStock", objectMapper.writeValueAsString(Map.of("coupon", "3000",
+                                                                                                                    "point", "2000"))))
                                               .build());
     }
 
@@ -84,7 +95,18 @@ class EventApplyServiceTest {
         eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON);
         assertThatThrownBy(() -> eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON))
             .isInstanceOf(IllegalArgumentException.class)
-            .hasMessage("이벤트 신청자 횟수를 초과했습니다.");
+            .hasMessage("이벤트 응모 가능 횟수를 초과했습니다.");
+    }
+
+    @Test
+    @DisplayName("1001 번째 고객은 신청 실패")
+    final void apply1001stUser_fails() {
+        IntStream.range(0, 1000)
+                 .forEach(i -> eventApplyService.apply(TEST_EVENT_PK2, String.valueOf(i), PrizeType.COUPON));
+
+        assertThatThrownBy(() -> eventApplyService.apply(TEST_EVENT_PK2, "1234567", PrizeType.COUPON))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessage("경품 재고가 부족합니다.");
     }
 
     @Test
@@ -120,7 +142,7 @@ class EventApplyServiceTest {
     }
 
     @Test
-    @DisplayName("포인트 받은 유저 모두 조회")
+    @DisplayName("쿠폰 받은 유저 모두 조회")
     final void getCouponPrizedUsers() {
         eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON);
         eventApplyService.apply(TEST_EVENT_PK, "2234567", PrizeType.COUPON);

@@ -55,7 +55,7 @@ public class EventApplyService {
             contents.put("stock", String.valueOf(stock));
         } else {
             // 조건에 맞지 않으면 반환
-            return;
+            throw new IllegalArgumentException("경품 재고가 부족합니다.");
         }
         existingItem.setContents(contents);
 
@@ -149,7 +149,7 @@ public class EventApplyService {
                                 final Map<String, String> contents = eventCustomData.getContents();
                                 final long applyLimit = Long.parseLong(contents.get("limit"));
                                 if (applyLimit <= applyCount) {
-                                    throw new IllegalArgumentException("이벤트 신청자 횟수를 초과했습니다.");
+                                    throw new IllegalArgumentException("이벤트 응모 가능 횟수를 초과했습니다.");
                                 }
                                 if (0 >= Integer.parseInt(contents.get("stock"))) {
                                     throw new IllegalArgumentException("경품 재고가 부족합니다.");
