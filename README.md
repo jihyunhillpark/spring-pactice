@@ -2,6 +2,9 @@
 
 This repo is for exercising spring framework😆
 
-- ✅ ex1. DynamoDB         
+- dynamodb-practice
+  - ✅ ex1-1. DynamoDB         
   - ✅ ex1-2. MariaDB     
-- ✅ ex2. Spring Batch     
+- spring-batch
+  - ✅ ex2. Spring Batch     
+
