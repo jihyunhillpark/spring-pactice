@@ -1,27 +1,28 @@
 package me.study.practice.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import me.study.practice.config.DynamoDBConfig;
-import me.study.practice.domain.EventCustomData;
-import me.study.practice.domain.PrizeType;
+import me.study.practice.domain.Event;
+import me.study.practice.domain.EventApply;
+import me.study.practice.domain.Reward;
+import me.study.practice.domain.SuppliedReward;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
+import software.amazon.awssdk.enhanced.dynamodb.DynamoDbEnhancedClient;
 import software.amazon.awssdk.enhanced.dynamodb.DynamoDbTable;
+import software.amazon.awssdk.enhanced.dynamodb.Key;
+import software.amazon.awssdk.enhanced.dynamodb.TableSchema;
 import software.amazon.awssdk.enhanced.dynamodb.model.CreateTableEnhancedRequest;
-import software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional;
 import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput;
 
-import java.util.Map;
-import java.util.stream.IntStream;
+import java.time.LocalDateTime;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatList;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 
 /**
@@ -31,143 +32,229 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @Import(DynamoDBConfig.class)
 class EventApplyServiceTest {
     private static final long MAX_APPLICANTS = 1000L;
-    private static final String TEST_EVENT_PK = "20240711-test";
-    private static final String TEST_EVENT_PK2 = "20240811-test";
-    private DynamoDbTable<EventCustomData> eventDataTable;
+    private static final String TEST_EVENT_PK = "event-id:20240711-test";
+    private static final String TEST_EVENT_PK2 = "event-id:20240811-test";
+    private static final String TEST_EVENT_SORT_KEY = "event-term:1";
+    private static final String TEST_REWARD_SORT_KEY = "reward-id:COUPON";
+    private static final String TEST_REWARD_SORT_KEY2 = "reward-id:POINT";
+    private DynamoDbTable<EventApply> eventDataTable;
     @Autowired
     private EventApplyService eventApplyService;
     @Autowired
-    private ObjectMapper objectMapper;
+    private DynamoDbEnhancedClient enhancedClient;
+    private DynamoDbTable<EventApply> eventApplyTable;
+    private DynamoDbTable<Event> eventTable;
+    private DynamoDbTable<Reward> rewardTable;
+    private DynamoDbTable<SuppliedReward> suppliedRewardTable;
 
     @BeforeEach
     void setUp() throws JsonProcessingException {
-        eventDataTable = initiateTable();
-        eventDataTable.putItem(EventCustomData.builder()
-                                              .primaryKey(TEST_EVENT_PK)
-                                              .contents(Map.of("limit", "1",
-                                                               "dailyLimit", "1",
-                                                               "stock", String.valueOf(MAX_APPLICANTS),
-                                                               "prizeStock", objectMapper.writeValueAsString(Map.of("coupon", "100",
-                                                                                                                    "point", "1000"))))
-                                              .build());
-        eventDataTable.putItem(EventCustomData.builder()
-                                              .primaryKey(TEST_EVENT_PK2)
-                                              .contents(Map.of("limit", "1",
-                                                               "dailyLimit", "1",
-                                                               "stock", String.valueOf(MAX_APPLICANTS),
-                                                               "prizeStock", objectMapper.writeValueAsString(Map.of("coupon", "3000",
-                                                                                                                    "point", "2000"))))
-                                              .build());
+        eventApplyTable = initiateTable("event-data", EventApply.class);
+        eventTable = initiateTable("event-data", Event.class);
+        rewardTable = initiateTable("event-data", Reward.class);
+        suppliedRewardTable = initiateTable("event-data", SuppliedReward.class);
+
+        createTestEventIfNotExists();
+        createTestRewardIfNotExists();
     }
+
 
     @Test
     @DisplayName("이벤트 신청 - 재고차감 후 바로 경품 지급")
     void apply() {
-        eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON);
-        final QueryConditional userQueryConditional = QueryConditional
-            .keyEqualTo(k -> k.partitionValue("1234567"));
-        final QueryConditional eventConditional = QueryConditional
-            .keyEqualTo(k -> k.partitionValue(TEST_EVENT_PK));
+        boolean result = eventApplyService.apply("20240711-test", "123456", "COUPON");
 
-        final DynamoDbTable<EventCustomData> eventCustomDataTable = eventApplyService.getEventCustomDataTable();
-        eventCustomDataTable.query(r -> r.queryConditional(userQueryConditional))
-                            .items()
-                            .stream()
-                            .findAny()
-                            .ifPresent(eventCustomData -> {
-                                final Map<String, String> contents = eventCustomData.getContents();
-                                assertThat(contents.get("eventId")).isEqualTo(TEST_EVENT_PK);
-                                assertThat(contents.get("prizeType")).isEqualTo(PrizeType.COUPON.name());
-                            });
-        eventCustomDataTable.query(r -> r.queryConditional(eventConditional))
-                            .items()
-                            .stream()
-                            .findAny()
-                            .ifPresent(eventCustomData -> {
-                                final Map<String, String> contents = eventCustomData.getContents();
-                                assertThat(contents.get("stock")).isEqualTo("999");
-                            });
+        // Assert
+        assertThat(result).isTrue();
+        // Verify that the EventApply item was created
+        final Key eventApplyKey = Key.builder()
+                                     .partitionValue("user-id:123456")
+                                     .sortValue(TEST_EVENT_PK + ";" + TEST_EVENT_SORT_KEY)
+                                     .build();
+        EventApply eventApply = eventApplyTable.getItem(eventApplyKey);
+        assertThat(eventApply).isNotNull();
+        assertThat(eventApply.getApplyStatus()).isEqualTo("APPLIED");
+
+        // Verify that the stock count was decremented
+        final Key rewardKey = Key.builder()
+                                 .partitionValue(TEST_EVENT_PK + ";" + TEST_EVENT_SORT_KEY)
+                                 .sortValue("reward-id:COUPON")
+                                 .build();
+        Reward reward = rewardTable.getItem(rewardKey);
+        assertThat(reward.getStockCount()).isEqualTo(999); // Assuming the initial stock was 1000
+
+        final Key suppliedRewardKey = Key.builder()
+                                         .partitionValue(TEST_EVENT_PK + ";" + TEST_EVENT_SORT_KEY + ";reward-id:COUPON")
+                                         .sortValue("user-id:123456")
+                                         .build();
+        SuppliedReward suppliedReward = suppliedRewardTable.getItem(suppliedRewardKey);
+        assertThat(suppliedReward).isNotNull();
     }
 
     @Test
     @DisplayName("apply - 중복 신청 실패")
     void duplicateApply_fails() {
-        eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON);
-        assertThatThrownBy(() -> eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON))
-            .isInstanceOf(IllegalArgumentException.class)
-            .hasMessage("이벤트 응모 가능 횟수를 초과했습니다.");
+        // Act
+        boolean result = eventApplyService.apply("20240711-test", "123456", "COUPON");
+        boolean duplicateResult = eventApplyService.apply("20240711-test", "123456", "COUPON");
+
+        // Assert
+        assertThat(duplicateResult).isFalse();
     }
 
     @Test
     @DisplayName("1001 번째 고객은 신청 실패")
-    final void apply1001stUser_fails() {
-        IntStream.range(0, 1000)
-                 .forEach(i -> eventApplyService.apply(TEST_EVENT_PK2, String.valueOf(i), PrizeType.COUPON));
+    void apply1001stUser_fails() {
+        // Setup
+        for (int i = 1; i <= 1000; i++) {
+            boolean result = eventApplyService.apply("20240711-test", "user-id:" + i, "COUPON");
+        }
 
-        assertThatThrownBy(() -> eventApplyService.apply(TEST_EVENT_PK2, "1234567", PrizeType.COUPON))
-            .isInstanceOf(IllegalArgumentException.class)
-            .hasMessage("경품 재고가 부족합니다.");
+        // Act
+        boolean result = eventApplyService.apply("20240711-test", "user-id:1001", "COUPON");
+
+        // Assert
+        assertThat(result).isFalse();
     }
 
     @Test
     @DisplayName("특정 유저의 이벤트 응모내역 조회")
     void getUserApplyHistory() {
-        eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK2, "1234567", PrizeType.POINT);
+        // Act
+        boolean result = eventApplyService.apply("20240711-test", "123456", "COUPON");
+        boolean result2 = eventApplyService.apply("20240811-test", "123456", "COUPON");
+        List<EventApply> applyHistory = eventApplyService.getUserApplyHistory("123456");
 
-        eventApplyService.getUserApplyHistory(TEST_EVENT_PK, "1234567")
-                         .stream()
-                         .findFirst()
-                         .ifPresent(eventCustomData -> {
-                             final Map<String, String> contents = eventCustomData.getContents();
-                             assertThat(contents.get("eventId")).isEqualTo(TEST_EVENT_PK);
-                             assertThat(contents.get("prizeType")).isEqualTo(PrizeType.COUPON.name());
-                         });
-
-    }
-
-    @Test
-    @DisplayName("포인트 받은 유저 모두 조회")
-    void getPointPrizedUsers() {
-        eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "2234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "3234567", PrizeType.POINT);
-        eventApplyService.apply(TEST_EVENT_PK, "4234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "5234567", PrizeType.POINT);
-        eventApplyService.apply(TEST_EVENT_PK, "6234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "7234567", PrizeType.POINT);
-
-        assertThatList(eventApplyService.getPrizeSuppliedUsers(TEST_EVENT_PK, PrizeType.POINT.name()))
-            .contains("3234567", "5234567", "7234567");
+        // Assert
+        assertThat(applyHistory).hasSize(2);
     }
 
     @Test
     @DisplayName("쿠폰 받은 유저 모두 조회")
-    final void getCouponPrizedUsers() {
-        eventApplyService.apply(TEST_EVENT_PK, "1234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "2234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "3234567", PrizeType.POINT);
-        eventApplyService.apply(TEST_EVENT_PK, "4234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "5234567", PrizeType.POINT);
-        eventApplyService.apply(TEST_EVENT_PK, "6234567", PrizeType.COUPON);
-        eventApplyService.apply(TEST_EVENT_PK, "7234567", PrizeType.POINT);
-
-        assertThatList(eventApplyService.getPrizeSuppliedUsers(TEST_EVENT_PK, PrizeType.COUPON.name()))
-            .contains("1234567", "2234567", "4234567", "6234567");
+    void getCouponPrizedUsers() {
+        boolean result = eventApplyService.apply("20240711-test", "123456", "COUPON");
+        boolean result2 = eventApplyService.apply("20240711-test", "123457", "COUPON");
+        boolean result3 = eventApplyService.apply("20240711-test", "123458", "COUPON");
+        boolean result4 = eventApplyService.apply("20240711-test", "111111", "POINT");
+        List<String> users = eventApplyService.getRewardSuppliedUsers("20240711-test", "COUPON");
+        assertThat(users).hasSize(3);
     }
 
-    private DynamoDbTable<EventCustomData> initiateTable() {
-        final CreateTableEnhancedRequest request = CreateTableEnhancedRequest.builder()
-                                                                             .provisionedThroughput(ProvisionedThroughput
-                                                                                                        .builder()
-                                                                                                        .readCapacityUnits(MAX_APPLICANTS)
-                                                                                                        .writeCapacityUnits(MAX_APPLICANTS)
-                                                                                                        .build())
-                                                                             .build();
-        final DynamoDbTable<EventCustomData> eventCustomDataTable = eventApplyService.getEventCustomDataTable();
-        if (null != eventCustomDataTable) eventCustomDataTable.deleteTable();
-        eventCustomDataTable.createTable(request);
-        System.out.printf("Tables created: %s", eventCustomDataTable.tableName());
-        return eventCustomDataTable;
+
+    @Test
+    @DisplayName("포인트 받은 유저 모두 조회")
+    void getPointPrizedUsers() {
+        boolean result = eventApplyService.apply("20240711-test", "123456", "COUPON");
+        boolean result2 = eventApplyService.apply("20240711-test", "123457", "COUPON");
+        boolean result3 = eventApplyService.apply("20240711-test", "123458", "COUPON");
+        boolean result4 = eventApplyService.apply("20240711-test", "111111", "POINT");
+        List<String> users = eventApplyService.getRewardSuppliedUsers("20240711-test", "POINT");
+        assertThat(users).hasSize(1);
     }
+
+    private <T> DynamoDbTable<T> initiateTable(String tableName, Class<T> clazz) {
+        DynamoDbTable<T> table = enhancedClient.table(tableName, TableSchema.fromBean(clazz));
+
+        // Drop the table if it exists
+        try {
+            table.deleteTable();
+        } catch (Exception e) {
+            // Ignore if table does not exist or other errors
+        }
+
+        // Recreate the table
+        CreateTableEnhancedRequest request = CreateTableEnhancedRequest.builder()
+                                                                       .provisionedThroughput(ProvisionedThroughput.builder()
+                                                                                                                   .readCapacityUnits(
+                                                                                                                       MAX_APPLICANTS)
+                                                                                                                   .writeCapacityUnits(
+                                                                                                                       MAX_APPLICANTS)
+                                                                                                                   .build())
+                                                                       .build();
+
+        table.createTable(request);
+        return table;
+    }
+
+    private void createTestEventIfNotExists() throws JsonProcessingException {
+        // Create test event if it does not exist
+        Event testEvent = Event.builder()
+                               .partitionKey(TEST_EVENT_PK)
+                               .sortKey(TEST_EVENT_SORT_KEY)
+                               .rewardIds(List.of(TEST_REWARD_SORT_KEY))
+                               .startAt(LocalDateTime.now().minusDays(1))
+                               .endAt(LocalDateTime.now().plusDays(1))
+                               .createdAt(LocalDateTime.now())
+                               .updatedAt(LocalDateTime.now())
+                               .build();
+        Event testEvent2 = Event.builder()
+                                .partitionKey(TEST_EVENT_PK2)
+                                .sortKey(TEST_EVENT_SORT_KEY)
+                                .rewardIds(List.of(TEST_REWARD_SORT_KEY))
+                                .startAt(LocalDateTime.now().minusDays(1))
+                                .endAt(LocalDateTime.now().plusDays(1))
+                                .createdAt(LocalDateTime.now())
+                                .updatedAt(LocalDateTime.now())
+                                .build();
+
+        eventTable.putItem(testEvent);
+        eventTable.putItem(testEvent2);
+    }
+
+    private void createTestRewardIfNotExists() {
+        // Create test reward if it does not exist
+        Reward testReward = Reward.builder()
+                                  .partitionKey(TEST_EVENT_PK + ";" + TEST_EVENT_SORT_KEY)
+                                  .sortKey(TEST_REWARD_SORT_KEY2)
+                                  .name("Test Reward")
+                                  .rewardType("POINT")
+                                  .eventId(TEST_EVENT_PK)
+                                  .stockCount(1000)
+                                  .createdAt(LocalDateTime.now())
+                                  .updatedAt(LocalDateTime.now())
+                                  .validFrom(LocalDateTime.now().minusDays(1))
+                                  .validTo(LocalDateTime.now().plusDays(1))
+                                  .build();
+        Reward testReward2 = Reward.builder()
+                                   .partitionKey(TEST_EVENT_PK2 + ";" + TEST_EVENT_SORT_KEY)
+                                   .sortKey(TEST_REWARD_SORT_KEY2)
+                                   .name("Test Reward")
+                                   .rewardType("POINT")
+                                   .eventId(TEST_EVENT_PK)
+                                   .stockCount(1000)
+                                   .createdAt(LocalDateTime.now())
+                                   .updatedAt(LocalDateTime.now())
+                                   .validFrom(LocalDateTime.now().minusDays(1))
+                                   .validTo(LocalDateTime.now().plusDays(1))
+                                   .build();
+        Reward testReward3 = Reward.builder()
+                                   .partitionKey(TEST_EVENT_PK + ";" + TEST_EVENT_SORT_KEY)
+                                   .sortKey(TEST_REWARD_SORT_KEY)
+                                   .name("Test Reward")
+                                   .rewardType("COUPON")
+                                   .eventId(TEST_EVENT_PK)
+                                   .stockCount(1000)
+                                   .createdAt(LocalDateTime.now())
+                                   .updatedAt(LocalDateTime.now())
+                                   .validFrom(LocalDateTime.now().minusDays(1))
+                                   .validTo(LocalDateTime.now().plusDays(1))
+                                   .build();
+        Reward testReward4 = Reward.builder()
+                                   .partitionKey(TEST_EVENT_PK2 + ";" + TEST_EVENT_SORT_KEY)
+                                   .sortKey(TEST_REWARD_SORT_KEY)
+                                   .name("Test Reward")
+                                   .rewardType("COUPON")
+                                   .eventId(TEST_EVENT_PK)
+                                   .stockCount(1000)
+                                   .createdAt(LocalDateTime.now())
+                                   .updatedAt(LocalDateTime.now())
+                                   .validFrom(LocalDateTime.now().minusDays(1))
+                                   .validTo(LocalDateTime.now().plusDays(1))
+                                   .build();
+        rewardTable.putItem(testReward);
+        rewardTable.putItem(testReward2);
+        rewardTable.putItem(testReward3);
+        rewardTable.putItem(testReward4);
+    }
+
 }

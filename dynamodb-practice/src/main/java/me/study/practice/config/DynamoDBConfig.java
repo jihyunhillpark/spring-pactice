@@ -14,7 +14,7 @@ import java.net.URISyntaxException;
 @Configuration
 public class DynamoDBConfig {
 
-    private static final String TABLE_NAME = "other-data";
+    private static final String TABLE_NAME = "event-data";
 
     @Bean
     public DynamoDbEnhancedClient dynamoDbEnhancedClient(DynamoDbClient dynamoDbClient) {
