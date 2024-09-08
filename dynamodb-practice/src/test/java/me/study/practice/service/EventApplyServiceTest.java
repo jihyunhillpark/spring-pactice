@@ -17,10 +17,19 @@ import software.amazon.awssdk.enhanced.dynamodb.DynamoDbTable;
 import software.amazon.awssdk.enhanced.dynamodb.Key;
 import software.amazon.awssdk.enhanced.dynamodb.TableSchema;
 import software.amazon.awssdk.enhanced.dynamodb.model.CreateTableEnhancedRequest;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput;
+import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
+import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -46,6 +55,8 @@ class EventApplyServiceTest {
     private DynamoDbTable<Event> eventTable;
     private DynamoDbTable<Reward> rewardTable;
     private DynamoDbTable<SuppliedReward> suppliedRewardTable;
+    @Autowired
+    private DynamoDbClient dynamoDbClient;
 
     @BeforeEach
     void setUp() throws JsonProcessingException {
@@ -104,17 +115,54 @@ class EventApplyServiceTest {
 
     @Test
     @DisplayName("1001 번째 고객은 신청 실패")
-    void apply1001stUser_fails() {
-        // Setup
-        for (int i = 1; i <= 1000; i++) {
-            boolean result = eventApplyService.apply("20240711-test", "user-id:" + i, "COUPON");
+    void apply1001stUser_fails() throws InterruptedException {
+        // Given
+        final int numberOfThreads = 1100;
+
+        try (ExecutorService executorService = Executors.newFixedThreadPool(100)) {
+            CountDownLatch latch = new CountDownLatch(numberOfThreads);
+            // Act
+            for (long i = 0; i < numberOfThreads; i++) {
+                long userId = i + 1;
+                executorService.submit(() -> {
+                    try {
+                        eventApplyService.apply("20240711-test", "user-id:" + userId, "COUPON");
+                    } catch (Exception e) {
+                        // Ignore exceptions
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+            latch.await();
+            executorService.shutdown();
         }
+        // Then
+        String partitionKeyValue = TEST_EVENT_PK + ";" + TEST_EVENT_SORT_KEY;
+        String suppliedRewardKey = TEST_EVENT_PK + ";" + TEST_EVENT_SORT_KEY + ";reward-id:COUPON";
+        final Key rewardKey = Key.builder()
+                                 .partitionValue(partitionKeyValue)
+                                 .sortValue("reward-id:COUPON")
+                                 .build();
+        Reward reward = rewardTable.getItem(rewardKey);
+        assertThat(reward.getStockCount()).isEqualTo(0);
 
-        // Act
-        boolean result = eventApplyService.apply("20240711-test", "user-id:1001", "COUPON");
+        // Query 요청 생성
+        Map<String, AttributeValue> expressionValues = new HashMap<>();
+        expressionValues.put(":v1", AttributeValue.builder().s(suppliedRewardKey).build());
 
-        // Assert
-        assertThat(result).isFalse();
+        QueryRequest queryRequest = QueryRequest.builder()
+                                                .tableName("event-data") // 테이블 이름
+                                                .keyConditionExpression("partitionKey = :v1") // 키 조건 표현식
+                                                .expressionAttributeValues(expressionValues)
+                                                .build();
+
+        // Query 실행
+        QueryResponse response = dynamoDbClient.query(queryRequest);
+
+        // 항목 개수 출력
+        int itemCount = response.count();
+        assertThat(itemCount).isEqualTo(1000);
     }
 
     @Test
